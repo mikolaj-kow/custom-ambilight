@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.padding import PKCS7
 import httpx
 
 from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_EFFECT, ATTR_HS_COLOR
-from homeassistant.exceptions import UpdateFailed
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .effects import EFFECTS
 
