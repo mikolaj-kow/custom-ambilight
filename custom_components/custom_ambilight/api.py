@@ -3,6 +3,7 @@
 import asyncio
 from base64 import b64decode
 import logging
+import time
 from typing import Any
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -22,6 +23,16 @@ RATE_LIMIT = 0.1
 TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 # Delay before retrying a transient connection error
 RETRY_DELAY = 3.0
+# Time after the last successful poll before the TV is considered unreachable.
+# Philips TVs intermittently drop off the network for 15-60 seconds (the TV
+# keeps running Ambilight while its API is unreachable), so tolerate short
+# dropouts instead of flipping the entity unavailable on every failed poll
+STALE_GRACE = 90.0
+
+
+def _err_desc(err: Exception) -> str:
+    """Return a description of the error, including the class for empty messages."""
+    return str(err) or type(err).__name__
 
 
 class MyApi:
@@ -42,6 +53,7 @@ class MyApi:
         self.EFFECTS = EFFECTS
         self.previous_state = None
         self._data = {}
+        self._last_success: float | None = None
 
     async def get_data(self) -> Any:
         """Fetch data from the API."""
@@ -54,11 +66,16 @@ class MyApi:
                 break
             except httpx.TransportError as err:
                 if attempt == 1:
-                    raise UpdateFailed(f"Error communicating with TV: {err}") from err
-                _LOGGER.warning("Transient connection error (%s), retrying", err)
+                    raise UpdateFailed(
+                        f"Error communicating with TV: {_err_desc(err)}"
+                    ) from err
+                _LOGGER.warning(
+                    "Transient connection error (%s), retrying", _err_desc(err)
+                )
                 await asyncio.sleep(RETRY_DELAY)
         await asyncio.sleep(RATE_LIMIT)
         self._data = response.json()
+        self._last_success = time.monotonic()
 
         # Check if the response matches the glitch state
         glitch_state = {
@@ -139,6 +156,12 @@ class MyApi:
         except Exception as e:
             _LOGGER.error(f"Failed to connect: {e}")
             return False
+
+    def is_available(self, max_age: float = STALE_GRACE) -> bool:
+        """Return True if the TV API responded recently."""
+        return self._last_success is not None and (
+            time.monotonic() - self._last_success
+        ) <= max_age
 
     def get_is_on(self):
         """Get the current power status from the data."""
