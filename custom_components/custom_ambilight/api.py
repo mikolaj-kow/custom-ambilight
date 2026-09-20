@@ -10,12 +10,18 @@ from cryptography.hazmat.primitives.padding import PKCS7
 import httpx
 
 from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_EFFECT, ATTR_HS_COLOR
+from homeassistant.exceptions import UpdateFailed
 
 from .effects import EFFECTS
 
 _LOGGER = logging.getLogger(__name__)
 # Define the rate limit (in seconds)
 RATE_LIMIT = 0.1
+# Philips TVs accept new (TLS) connections slowly, especially while running
+# Ambilight in standby, which can exceed httpx's 5s default connect timeout
+TIMEOUT = httpx.Timeout(15.0, connect=10.0)
+# Delay before retrying a transient connection error
+RETRY_DELAY = 3.0
 
 
 class MyApi:
@@ -29,7 +35,9 @@ class MyApi:
         self.password = password
         self.url = f"{connection_type}://{host}:1926/6" if connection_type == "https" else f"http://{host}:1925/6"
         self.client = httpx.AsyncClient(
-            auth=httpx.DigestAuth(username, password) if connection_type == "https" else None, verify=False
+            auth=httpx.DigestAuth(username, password) if connection_type == "https" else None,
+            verify=False,
+            timeout=TIMEOUT,
         )
         self.EFFECTS = EFFECTS
         self.previous_state = None
@@ -37,7 +45,18 @@ class MyApi:
 
     async def get_data(self) -> Any:
         """Fetch data from the API."""
-        response = await self.client.get(f"{self.url}/ambilight/currentconfiguration")
+        # Retry once on transient transport errors (e.g. slow TLS handshake
+        # while the TV is in standby) so the coordinator does not flag the
+        # entity unavailable on every hiccup
+        for attempt in range(2):
+            try:
+                response = await self.client.get(f"{self.url}/ambilight/currentconfiguration")
+                break
+            except httpx.TransportError as err:
+                if attempt == 1:
+                    raise UpdateFailed(f"Error communicating with TV: {err}") from err
+                _LOGGER.warning("Transient connection error (%s), retrying", err)
+                await asyncio.sleep(RETRY_DELAY)
         await asyncio.sleep(RATE_LIMIT)
         self._data = response.json()
 
@@ -62,7 +81,9 @@ class MyApi:
             # Reset the connection
             await self.client.aclose()
             self.client = httpx.AsyncClient(
-                auth=httpx.DigestAuth(self.username, self.password), verify=False
+                auth=httpx.DigestAuth(self.username, self.password),
+                verify=False,
+                timeout=TIMEOUT,
             )
             # Restore the previous state
             if any(
